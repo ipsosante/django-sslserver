@@ -23,19 +23,23 @@ else:
     upath = unicode
 
 class SecureHTTPServer(WSGIServer):
-    def __init__(self, address, handler_cls, certificate, key, client_certificate=None):
+    def __init__(self, address, handler_cls, certificate, key, client_certificate=None, crl=None):
         super(SecureHTTPServer, self).__init__(address, handler_cls)
 
+        ctx = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(certificate, key)
+
         if client_certificate:
-            self.socket = ssl.wrap_socket(self.socket, certfile=certificate,
-                                          keyfile=key, server_side=True,
-                                          ssl_version=ssl.PROTOCOL_TLSv1_2,
-                                          cert_reqs=ssl.CERT_REQUIRED,ca_certs=client_certificate)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(cafile=client_certificate)
         else:
-            self.socket = ssl.wrap_socket(self.socket, certfile=certificate,
-                                      keyfile=key, server_side=True,
-                                      ssl_version=ssl.PROTOCOL_TLSv1_2,
-                                      cert_reqs=ssl.CERT_NONE)
+            ctx.verify_mode = ssl.CERT_NONE
+
+        if crl:
+             ctx.verify_flags = ssl.VERIFY_CRL_CHECK_LEAF
+             ctx.load_verify_locations(cafile=crl)
+
+        self.socket = ctx.wrap_socket(sock=self.socket, server_side=True)
 
 
 class WSGIRequestHandler(WSGIRequestHandler):
@@ -64,6 +68,7 @@ class Command(runserver.Command):
                                 "development.key"),
                             help="Path to the key file"),
         parser.add_argument("--client-certificate",action='store',help='Path to the client certificate',dest='client_certificate')
+        parser.add_argument("--crl",action='store',help='Path to the crl file',dest='crl')
         parser.add_argument("--nostatic", dest='use_static_handler',
                             action='store_false', default=None,
                             help="Do not use internal static file handler"),
@@ -98,7 +103,7 @@ class Command(runserver.Command):
             return True
         return False
 
-    def check_certs(self, key_file, cert_file, client_cert_file=None):
+    def check_certs(self, key_file, cert_file, client_cert_file=None, crl_file=None):
         # TODO: maybe validate these? wrap_socket doesn't...
 
         if not os.path.exists(key_file):
@@ -111,6 +116,10 @@ class Command(runserver.Command):
             raise CommandError("Can't find (client) certificate at %s" %
                                client_cert_file)
 
+        if crl_file and not os.path.exists(crl_file):
+            raise CommandError("Can't find crl file at %s" %
+                               crl_file)
+
 
     def inner_run(self, *args, **options):
         # Django did a shitty job abstracting this.
@@ -118,7 +127,8 @@ class Command(runserver.Command):
         key_file = options.get("key")
         cert_file = options.get("certificate")
         client_cert_file = options.get("client_certificate")
-        self.check_certs(key_file, cert_file, client_cert_file)
+        crl_file = options.get("crl")
+        self.check_certs(key_file, cert_file, client_cert_file, crl_file)
 
         from django.conf import settings
         from django.utils import translation
@@ -135,7 +145,8 @@ class Command(runserver.Command):
             "Starting development server at https://%(addr)s:%(port)s/\n"
             "Using SSL certificate: %(cert)s\n"
             "Using SSL key: %(key)s\n"
-            "Using SSL client certifcate: %(client_cert)s\n"
+            "Using SSL client certificate: %(client_cert)s\n"
+            "Using SSL certificate revocation list: %(crl)s\n"
             "Quit the server with %(quit_command)s.\n"
         ) % {
             "started_at": datetime.now().strftime('%B %d, %Y - %X'),
@@ -147,6 +158,7 @@ class Command(runserver.Command):
             "cert": os.path.abspath(cert_file) if cert_file else None,
             "key": os.path.abspath(key_file) if key_file else None,
             "client_cert": os.path.abspath(client_cert_file) if client_cert_file else None,
+            "crl": os.path.abspath(crl_file) if crl_file else None,
         })
         # django.core.management.base forces the locale to en-us. We should
         # set it up correctly for the first request (particularly important
@@ -157,7 +169,7 @@ class Command(runserver.Command):
             handler = self.get_handler(*args, **options)
             server = SecureHTTPServer((self.addr, int(self.port)),
                                       WSGIRequestHandler,
-                                      cert_file, key_file, client_cert_file)
+                                      cert_file, key_file, client_cert_file, crl_file)
             server.set_app(handler)
             server.serve_forever()
 
